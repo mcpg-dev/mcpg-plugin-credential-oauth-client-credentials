@@ -1,0 +1,24 @@
+schema: mcpg.dev/plugin/v1
+id: dev.mcpg.credential.oauth-client-credentials
+name: OAuth 2.0 Client Credentials Issuer
+license: Apache-2.0
+description: |
+  Outbound OAuth 2.0 token issuer (RFC 6749 §4.4 client_credentials grant).
+  Operator declares N named providers (token endpoint URL + client_id +
+  client_secret + scopes). The plugin POSTs the grant request, caches the
+  access token in-process keyed by provider name, and refreshes
+  proactively before expiry. Returns the access token as
+  `IssuedCredential.value` so bindings can reference it via the
+  standard `cred://dev.mcpg.credential.oauth-client-credentials/<provider>`
+  URI scheme.
+
+  Per-provider mutex serializes refreshes to prevent thundering herd.
+  On refresh failure, returns the stale token within a short grace
+  window. Identity is observed but not used for authorization in v0.1.
+
+  Operator config under `plugins[*].config`. See README.md.
+class: credential_issuer
+runtime: native-cdylib-v1
+protocol_version: "1.0"
+required_capabilities:
+  - network_outbound
