@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-plugin-credential-oauth-client-credentials"
-version = "0.1.0-rc.5"
+version = "0.1.0"
 license = "Apache-2.0"
 edition = "2024"
 description = "OAuth 2.0 client_credentials credential_issuer plugin for MCPG (RFC 6749 §4.4)"
