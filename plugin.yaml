@@ -5,8 +5,10 @@ license: Apache-2.0
 description: |
   Outbound OAuth 2.0 token issuer (RFC 6749 §4.4 client_credentials grant).
   Operator declares N named providers (token endpoint URL + client_id +
-  client_secret + scopes). The plugin POSTs the grant request, caches the
-  access token in-process keyed by provider name, and refreshes
+  client_secret + scopes + optional RFC 8707 resource). The plugin POSTs
+  the grant request with the provider's resource, else the per-call one
+  (a federation sends its upstream's canonical URI), caches the access
+  token in-process keyed by provider name and resource, and refreshes
   proactively before expiry. Returns the access token as
   `IssuedCredential.value` so bindings can reference it via the
   standard `cred://dev.mcpg.credential.oauth-client-credentials/<provider>`

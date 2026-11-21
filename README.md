@@ -14,7 +14,13 @@ backend binding, to own the refresh loop.
 
 ## What it does
 - POSTs a `client_credentials` grant to each provider's `token_url` and caches
-  the access token in-process, keyed by provider name.
+  the access token in-process, keyed by provider name and `resource`.
+- Sends the RFC 8707 `resource` that MCP authorization requires on every token
+  request: the provider's `resource`, else the `resource` of the per-call
+  config. An MCP federation in `oauth_client_credentials` mode sends the
+  canonical URI of its upstream (`upstream.url` without user information,
+  query or fragment) unless its `credential_config` names a `resource`.
+  Without either, no `resource` is sent.
 - Refreshes `refresh_buffer_ms` ahead of real expiry, and reports
   `IssuedCredential.ttl_seconds` against that same horizon so the gateway's own
   credential cache evicts before the provider starts rejecting the token.
@@ -47,6 +53,7 @@ plugins:
           client_id: mcpg-gateway
           client_secret: ${env.BILLING_CLIENT_SECRET}
           scopes: ["invoices.read", "invoices.write"]
+          resource: https://billing.example.com/mcp   # optional (RFC 8707)
           refresh_buffer_ms: 60000
           timeout_ms: 5000
 ```
@@ -63,6 +70,7 @@ Each entry under `providers`:
 | `client_id` | string | — (required) | OAuth client id. |
 | `client_secret` | string | — (required) | OAuth client secret; source it with `${env.VAR}` so no literal lands in the config artifact. |
 | `scopes` | string[] | `[]` | Scopes requested, sent space-joined per RFC 6749 §3.3. Omitted from the request when empty. |
+| `resource` | string | — | RFC 8707 resource indicator sent on every token request; an absolute `http://` or `https://` URI without a fragment. Takes precedence over the per-call `resource`. |
 | `grant_type` | string | `client_credentials` | Only `client_credentials` is accepted; any other value fails validation. |
 | `refresh_buffer_ms` | u64 | `60000` | How far ahead of expiry a cached token is treated as stale. Range `0..=600000`. |
 | `timeout_ms` | u64 | `5000` | Per-request timeout against the token endpoint. Range `100..=60000`. |

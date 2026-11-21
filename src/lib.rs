@@ -9,13 +9,18 @@
 //! per-provider mutex serializes refreshes so concurrent callers
 //! don't all hit the token endpoint at once.
 //!
+//! Each token request carries the RFC 8707 `resource` the MCP
+//! authorization spec requires: the provider's configured `resource`,
+//! else the `resource` of the per-call config (a federation passes the
+//! canonical URI of its upstream).
+//!
 //! ## Caching layers
 //!
 //! Two caches sit in front of the OAuth provider:
 //!
 //! 1. **In-plugin token cache** (this crate) — keyed by provider
-//!    name only, so every caller identity sees the same access
-//!    token. Holds tokens until `expires_at - refresh_buffer_ms`.
+//!    name and `resource`, so every caller identity sees the same
+//!    access token for one resource. Holds tokens until `expires_at - refresh_buffer_ms`.
 //! 2. **Host credential cache** — per
 //!    `(identity_hash, plugin_id, target)` — caches the
 //!    `IssuedCredential` so repeat callers don't even cross the
@@ -94,6 +99,10 @@ fn default_token_type() -> String {
     "Bearer".to_owned()
 }
 
+/// A cached token: the provider name and the `resource` it was requested
+/// for, since a token is audience-restricted to that resource.
+type TokenKey = (String, Option<String>);
+
 pub struct OAuthClientCredentialsPlugin {
     inner: Arc<Inner>,
 }
@@ -102,7 +111,7 @@ struct Inner {
     manifest: PluginManifest,
     config: OAuthConfig,
     http_client: reqwest::Client,
-    tokens: DashMap<String, CachedToken>,
+    tokens: DashMap<TokenKey, CachedToken>,
     refresh_guards: BTreeMap<String, TokioMutex<()>>,
     /// Tokio runtime for the SyncCredentialIssuer FFI path.
     /// Lazily built on first sync call so async-only consumers
@@ -172,18 +181,46 @@ impl OAuthClientCredentialsPlugin {
     }
 }
 
+/// The `resource` a token request of `provider` carries: the configured
+/// one, else a non-empty `resource` string of the per-call `call_config`.
+fn requested_resource(
+    provider_name: &str,
+    provider: &ProviderConfig,
+    call_config: &Value,
+) -> Result<Option<String>, CredentialError> {
+    if let Some(ref resource) = provider.resource {
+        return Ok(Some(resource.clone()));
+    }
+    match call_config.get("resource") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(resource)) if resource.is_empty() => Ok(None),
+        Some(Value::String(resource)) if config::is_resource_uri(resource) => {
+            Ok(Some(resource.clone()))
+        }
+        Some(_) => Err(CredentialError::Misconfigured {
+            reason: format!(
+                "per-call resource for `{provider_name}` must be an absolute http(s) URI \
+                 without a fragment"
+            ),
+        }),
+    }
+}
+
 async fn issue_inner(
     inner: &Inner,
     provider_name: &str,
+    call_config: &Value,
 ) -> Result<IssuedCredential, CredentialError> {
     let provider = inner.config.providers.get(provider_name).ok_or_else(|| {
         CredentialError::Misconfigured {
             reason: format!("unknown provider `{provider_name}`"),
         }
     })?;
+    let resource = requested_resource(provider_name, provider, call_config)?;
+    let key: TokenKey = (provider_name.to_owned(), resource);
 
     // Fast path: cache hit before refresh window.
-    if let Some(cached) = inner.tokens.get(provider_name)
+    if let Some(cached) = inner.tokens.get(&key)
         && cached.is_valid_now()
     {
         metrics::counter!(
@@ -202,7 +239,7 @@ async fn issue_inner(
         .expect("refresh guard exists for every configured provider");
     let _lock = guard.lock().await;
 
-    if let Some(cached) = inner.tokens.get(provider_name)
+    if let Some(cached) = inner.tokens.get(&key)
         && cached.is_valid_now()
     {
         metrics::counter!(
@@ -213,7 +250,7 @@ async fn issue_inner(
         return Ok(cached_to_issued(&cached));
     }
 
-    match fetch_token(inner, provider_name, provider).await {
+    match fetch_token(inner, provider_name, provider, key.1.as_deref()).await {
         Ok(fresh) => {
             metrics::counter!(
                 "mcpg_oauth_token_refresh_total",
@@ -221,7 +258,7 @@ async fn issue_inner(
             )
             .increment(1);
             let issued = cached_to_issued(&fresh);
-            inner.tokens.insert(provider_name.to_owned(), fresh);
+            inner.tokens.insert(key, fresh);
             Ok(issued)
         }
         Err(refresh_err) => {
@@ -230,7 +267,7 @@ async fn issue_inner(
                 "provider" => provider_name.to_owned(),
             )
             .increment(1);
-            if let Some(cached) = inner.tokens.get(provider_name)
+            if let Some(cached) = inner.tokens.get(&key)
                 && cached.within_grace_now()
             {
                 warn!(
@@ -271,6 +308,7 @@ async fn fetch_token(
     inner: &Inner,
     provider_name: &str,
     provider: &ProviderConfig,
+    resource: Option<&str>,
 ) -> Result<CachedToken, CredentialError> {
     let timeout = Duration::from_millis(provider.timeout_ms);
     let scope_joined = provider.scopes.join(" ");
@@ -279,6 +317,9 @@ async fn fetch_token(
         ("client_id", provider.client_id.as_str()),
         ("client_secret", provider.client_secret.as_str()),
     ];
+    if let Some(resource) = resource {
+        form.push(("resource", resource));
+    }
     if !provider.scopes.is_empty() {
         form.push(("scope", scope_joined.as_str()));
     }
@@ -375,9 +416,9 @@ impl CredentialIssuer for OAuthClientCredentialsPlugin {
         &self,
         _identity: &PluginIdentity,
         target: &str,
-        _config: &Value,
+        config: &Value,
     ) -> Result<IssuedCredential, CredentialError> {
-        issue_inner(&self.inner, target).await
+        issue_inner(&self.inner, target, config).await
     }
 
     // OAuth client_credentials tokens have no per-token lease; the
@@ -394,7 +435,7 @@ impl SyncCredentialIssuer for OAuthClientCredentialsPlugin {
         &self,
         _identity: &PluginIdentity,
         target: &str,
-        _config: &Value,
+        config: &Value,
     ) -> Result<IssuedCredential, CredentialError> {
         let runtime = self.inner.sync_runtime.get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread()
@@ -405,7 +446,8 @@ impl SyncCredentialIssuer for OAuthClientCredentialsPlugin {
         });
         let inner = Arc::clone(&self.inner);
         let target = target.to_owned();
-        runtime.block_on(async move { issue_inner(&inner, &target).await })
+        let config = config.clone();
+        runtime.block_on(async move { issue_inner(&inner, &target, &config).await })
     }
 }
 
@@ -616,6 +658,147 @@ mod tests {
         let _ = CredentialIssuer::issue(&plugin, &anon_identity(), "test", &json!({}))
             .await
             .unwrap();
+    }
+
+    fn build_with_resource(url: &str, resource: Option<&str>) -> OAuthClientCredentialsPlugin {
+        let mut cfg = json!({
+            "providers": {
+                "test": {
+                    "token_url": url,
+                    "client_id": "cid",
+                    "client_secret": "csecret"
+                }
+            }
+        });
+        if let Some(resource) = resource {
+            cfg["providers"]["test"]["resource"] = json!(resource);
+        }
+        OAuthClientCredentialsPlugin::from_config_json(&cfg.to_string())
+    }
+
+    /// The `resource` field of the one token request `server` received.
+    async fn sent_resource(server: &MockServer) -> Option<String> {
+        let requests = server.received_requests().await.expect("recorded");
+        assert_eq!(requests.len(), 1, "one token request");
+        let body = std::str::from_utf8(&requests[0].body).expect("form body");
+        body.split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .find(|(name, _)| *name == "resource")
+            .map(|(_, value)| form_decode(value))
+    }
+
+    fn form_decode(value: &str) -> String {
+        let bytes = value.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'+' => out.push(b' '),
+                b'%' => {
+                    let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).expect("escape");
+                    out.push(u8::from_str_radix(hex, 16).expect("hex"));
+                    i += 2;
+                }
+                b => out.push(b),
+            }
+            i += 1;
+        }
+        String::from_utf8(out).expect("utf-8")
+    }
+
+    async fn token_server(token: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": token,
+                "expires_in": 3600
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn the_configured_resource_is_sent() {
+        let server = token_server("tok").await;
+        let plugin = build_with_resource(
+            &format!("{}/token", server.uri()),
+            Some("https://mcp.example.com/mcp"),
+        );
+        let call = json!({ "resource": "https://other.example.com/mcp" });
+        CredentialIssuer::issue(&plugin, &anon_identity(), "test", &call)
+            .await
+            .unwrap();
+        assert_eq!(
+            sent_resource(&server).await.as_deref(),
+            Some("https://mcp.example.com/mcp"),
+            "the configured resource wins over the per-call one"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_per_call_resource_is_sent_when_none_is_configured() {
+        let server = token_server("tok").await;
+        let plugin = build_with_resource(&format!("{}/token", server.uri()), None);
+        let call = json!({ "resource": "https://mcp.example.com/mcp", "audience": "ignored" });
+        CredentialIssuer::issue(&plugin, &anon_identity(), "test", &call)
+            .await
+            .unwrap();
+        assert_eq!(
+            sent_resource(&server).await.as_deref(),
+            Some("https://mcp.example.com/mcp")
+        );
+    }
+
+    #[tokio::test]
+    async fn no_resource_is_sent_without_one() {
+        let server = token_server("tok").await;
+        let plugin = build_with_resource(&format!("{}/token", server.uri()), None);
+        CredentialIssuer::issue(&plugin, &anon_identity(), "test", &Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(sent_resource(&server).await, None);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_per_call_resource_is_refused_before_any_request() {
+        let server = token_server("tok").await;
+        let plugin = build_with_resource(&format!("{}/token", server.uri()), None);
+        for bad in [json!("https://mcp.example.com/mcp#x"), json!(7)] {
+            let err = CredentialIssuer::issue(
+                &plugin,
+                &anon_identity(),
+                "test",
+                &json!({ "resource": bad }),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(err, CredentialError::Misconfigured { .. }),
+                "{err:?}"
+            );
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tokens_are_cached_per_resource() {
+        let server = token_server("tok").await;
+        let plugin = build_with_resource(&format!("{}/token", server.uri()), None);
+        let id = anon_identity();
+        for resource in ["https://a.example.com/mcp", "https://b.example.com/mcp"] {
+            for _ in 0..2 {
+                CredentialIssuer::issue(&plugin, &id, "test", &json!({ "resource": resource }))
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "one token request per resource"
+        );
     }
 
     #[tokio::test]

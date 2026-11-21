@@ -11,6 +11,7 @@
 //!           client_id: gh-app-id
 //!           client_secret: ${env.GH_CLIENT_SECRET}
 //!           scopes: [repo, read:org]
+//!           resource: https://mcp.example.com/mcp   # optional (RFC 8707)
 //! ```
 
 use std::collections::BTreeMap;
@@ -44,6 +45,14 @@ pub struct ProviderConfig {
     /// OAuth scopes to request. Sent space-joined per RFC 6749 §3.3.
     #[serde(default)]
     pub scopes: Vec<String>,
+
+    /// RFC 8707 `resource` sent on every token request: the canonical
+    /// URI of the protected resource the token is for, such as an MCP
+    /// server. When set, it is always sent; when absent, the per-call
+    /// `resource` the host supplies (a federation sends the canonical URI
+    /// of its upstream) is sent, and without either none is.
+    #[serde(default)]
+    pub resource: Option<String>,
 
     /// OAuth grant type. Defaults to `client_credentials`. v0.1 only
     /// supports `client_credentials`; any other value is rejected at
@@ -105,6 +114,24 @@ pub enum ConfigError {
         "credential.oauth-client-credentials: provider `{name}` refresh_buffer_ms={buffer}; must be 0..=600_000"
     )]
     InvalidRefreshBufferMs { name: String, buffer: u64 },
+    #[error(
+        "credential.oauth-client-credentials: provider `{name}` resource must be an absolute http:// or https:// URI without a fragment"
+    )]
+    InvalidResource { name: String },
+}
+
+/// Whether `resource` can be an RFC 8707 resource indicator: an absolute
+/// `http(s)` URI without a fragment.
+pub(crate) fn is_resource_uri(resource: &str) -> bool {
+    let rest = resource
+        .strip_prefix("https://")
+        .or_else(|| resource.strip_prefix("http://"));
+    rest.is_some_and(|rest| {
+        !rest.is_empty()
+            && !rest.starts_with('/')
+            && !resource.contains('#')
+            && !resource.chars().any(char::is_whitespace)
+    })
 }
 
 impl OAuthConfig {
@@ -151,6 +178,13 @@ impl OAuthConfig {
                     buffer: provider.refresh_buffer_ms,
                 });
             }
+            if provider
+                .resource
+                .as_deref()
+                .is_some_and(|resource| !is_resource_uri(resource))
+            {
+                return Err(ConfigError::InvalidResource { name: name.clone() });
+            }
         }
         Ok(())
     }
@@ -181,6 +215,35 @@ mod tests {
         assert_eq!(p.grant_type, "client_credentials");
         assert_eq!(p.refresh_buffer_ms, 60_000);
         assert_eq!(p.timeout_ms, 5_000);
+        assert_eq!(p.resource, None);
+    }
+
+    #[test]
+    fn accepts_a_resource_uri_and_rejects_anything_else() {
+        let mut v = minimal();
+        v["providers"]["github"]["resource"] = json!("https://mcp.example.com/mcp");
+        let cfg = OAuthConfig::parse(&v.to_string()).unwrap();
+        assert_eq!(
+            cfg.providers["github"].resource.as_deref(),
+            Some("https://mcp.example.com/mcp")
+        );
+        for bad in [
+            "",
+            "mcp.example.com",
+            "https://",
+            "https:///mcp",
+            "https://mcp.example.com/mcp#frag",
+            "ftp://mcp.example.com",
+        ] {
+            v["providers"]["github"]["resource"] = json!(bad);
+            assert!(
+                matches!(
+                    OAuthConfig::parse(&v.to_string()).unwrap_err(),
+                    ConfigError::InvalidResource { .. }
+                ),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
