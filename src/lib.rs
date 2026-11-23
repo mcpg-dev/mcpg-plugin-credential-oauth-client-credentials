@@ -14,6 +14,15 @@
 //! else the `resource` of the per-call config (a federation passes the
 //! canonical URI of its upstream).
 //!
+//! ## Client authentication
+//!
+//! A provider authenticates with `client_secret_post` (the default),
+//! `client_secret_basic`, or `private_key_jwt`: a fresh RFC 7523 §2.2
+//! client assertion per token request, signed with the configured PEM or
+//! JWK private key, with no client secret. With `metadata_url` set, the
+//! plugin first checks that the authorization server's RFC 8414 metadata
+//! lists the method.
+//!
 //! ## Caching layers
 //!
 //! Two caches sit in front of the OAuth provider:
@@ -22,10 +31,12 @@
 //!    name and `resource`, so every caller identity sees the same
 //!    access token for one resource. Holds tokens until `expires_at - refresh_buffer_ms`.
 //! 2. **Host credential cache** — per
-//!    `(identity_hash, plugin_id, target)` — caches the
+//!    `(identity_hash, plugin_id, target, per-call config)` — caches the
 //!    `IssuedCredential` so repeat callers don't even cross the
-//!    plugin boundary. The reported `ttl_seconds` matches the
-//!    in-plugin cache horizon, so both layers evict in lockstep.
+//!    plugin boundary. The per-call config carries the `resource`, so
+//!    the host keeps one entry per resource too. The reported
+//!    `ttl_seconds` matches the in-plugin cache horizon, so both layers
+//!    evict in lockstep.
 //!
 //! ## Failure semantics
 //!
@@ -36,6 +47,7 @@
 //! unrecoverable secret rotation surfaces once the grace window
 //! expires.
 
+mod client_auth;
 mod config;
 
 use std::collections::BTreeMap;
@@ -54,6 +66,8 @@ use tokio::runtime::Runtime;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::warn;
 
+use client_auth::ClientAuth;
+pub use client_auth::{AssertionAudience, ClientAuthMethod, SigningAlg};
 pub use config::{ConfigError, OAuthConfig, ProviderConfig};
 
 const PLUGIN_ID: &str = "dev.mcpg.credential.oauth-client-credentials";
@@ -112,6 +126,12 @@ struct Inner {
     config: OAuthConfig,
     http_client: reqwest::Client,
     tokens: DashMap<TokenKey, CachedToken>,
+    /// Client authentication per provider, keys parsed at load.
+    client_auth: BTreeMap<String, ClientAuth>,
+    /// Issuer identifier of each provider whose `metadata_url` passed
+    /// [`client_auth::check_metadata`]; fetched once, before the first
+    /// token request.
+    verified_issuers: DashMap<String, String>,
     refresh_guards: BTreeMap<String, TokioMutex<()>>,
     /// Tokio runtime for the SyncCredentialIssuer FFI path.
     /// Lazily built on first sync call so async-only consumers
@@ -146,6 +166,16 @@ impl OAuthClientCredentialsPlugin {
             .keys()
             .map(|name| (name.clone(), TokioMutex::new(())))
             .collect();
+        let client_auth: BTreeMap<String, ClientAuth> = cfg
+            .providers
+            .iter()
+            .map(|(name, provider)| {
+                let auth = provider
+                    .client_auth()
+                    .expect("client authentication validated by OAuthConfig::parse");
+                (name.clone(), auth)
+            })
+            .collect();
         tracing::info!(
             plugin_id = PLUGIN_ID,
             provider_count = cfg.providers.len(),
@@ -174,6 +204,8 @@ impl OAuthClientCredentialsPlugin {
                 config: cfg,
                 http_client,
                 tokens: DashMap::new(),
+                client_auth,
+                verified_issuers: DashMap::new(),
                 refresh_guards,
                 sync_runtime: OnceLock::new(),
             }),
@@ -304,6 +336,68 @@ fn cached_to_issued(cached: &CachedToken) -> IssuedCredential {
     }
 }
 
+/// The issuer identifier of `provider`'s authorization server: the one its
+/// `metadata_url` publishes once the metadata passed
+/// [`client_auth::check_metadata`], else the configured `issuer`.
+async fn verified_issuer(
+    inner: &Inner,
+    provider_name: &str,
+    provider: &ProviderConfig,
+    auth: &ClientAuth,
+) -> Result<Option<String>, CredentialError> {
+    let Some(metadata_url) = provider.metadata_url.as_deref() else {
+        return Ok(provider.issuer.clone());
+    };
+    if let Some(issuer) = inner.verified_issuers.get(provider_name) {
+        return Ok(Some(issuer.clone()));
+    }
+    let response = inner
+        .http_client
+        .get(metadata_url)
+        .timeout(Duration::from_millis(provider.timeout_ms))
+        .send()
+        .await
+        .map_err(|e| CredentialError::Backend {
+            reason: format!("authorization server metadata unreachable for `{provider_name}`: {e}"),
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        let reason =
+            format!("authorization server metadata returned HTTP {status} for `{provider_name}`");
+        return Err(if status.is_client_error() {
+            CredentialError::Misconfigured { reason }
+        } else {
+            CredentialError::Backend { reason }
+        });
+    }
+    let metadata: Value = response
+        .json()
+        .await
+        .map_err(|e| CredentialError::Backend {
+            reason: format!(
+                "failed to parse authorization server metadata for `{provider_name}`: {e}"
+            ),
+        })?;
+    let issuer = client_auth::check_metadata(&metadata, auth.method(), auth.signing_alg())
+        .map_err(|reason| CredentialError::Misconfigured {
+            reason: format!("provider `{provider_name}`: {reason}"),
+        })?;
+    if let Some(configured) = provider.issuer.as_deref()
+        && configured != issuer
+    {
+        return Err(CredentialError::Misconfigured {
+            reason: format!(
+                "provider `{provider_name}`: the metadata issuer does not match the configured \
+                 issuer {configured:?}"
+            ),
+        });
+    }
+    inner
+        .verified_issuers
+        .insert(provider_name.to_owned(), issuer.clone());
+    Ok(Some(issuer))
+}
+
 async fn fetch_token(
     inner: &Inner,
     provider_name: &str,
@@ -311,23 +405,26 @@ async fn fetch_token(
     resource: Option<&str>,
 ) -> Result<CachedToken, CredentialError> {
     let timeout = Duration::from_millis(provider.timeout_ms);
-    let scope_joined = provider.scopes.join(" ");
-    let mut form: Vec<(&str, &str)> = vec![
-        ("grant_type", provider.grant_type.as_str()),
-        ("client_id", provider.client_id.as_str()),
-        ("client_secret", provider.client_secret.as_str()),
-    ];
+    let auth = inner
+        .client_auth
+        .get(provider_name)
+        .expect("client authentication exists for every configured provider");
+    let issuer = verified_issuer(inner, provider_name, provider, auth).await?;
+    let mut form: Vec<(&'static str, String)> = vec![("grant_type", provider.grant_type.clone())];
     if let Some(resource) = resource {
-        form.push(("resource", resource));
+        form.push(("resource", resource.to_owned()));
     }
     if !provider.scopes.is_empty() {
-        form.push(("scope", scope_joined.as_str()));
+        form.push(("scope", provider.scopes.join(" ")));
     }
+    let request = inner.http_client.post(&provider.token_url).timeout(timeout);
+    let request = auth
+        .authenticate(request, &mut form, &provider.token_url, issuer.as_deref())
+        .map_err(|reason| CredentialError::Misconfigured {
+            reason: format!("client authentication for `{provider_name}`: {reason}"),
+        })?;
     let started = Instant::now();
-    let response = inner
-        .http_client
-        .post(&provider.token_url)
-        .timeout(timeout)
+    let response = request
         .form(&form)
         .send()
         .await
@@ -799,6 +896,275 @@ mod tests {
             2,
             "one token request per resource"
         );
+    }
+
+    const EC_PRIV: &str = include_str!("testdata/ec_priv.pem");
+    const EC_PUB: &str = include_str!("testdata/ec_pub.pem");
+    const RSA_JWK: &str = include_str!("testdata/rsa_priv.jwk.json");
+    const RSA_PUB: &str = include_str!("testdata/rsa_pub.pem");
+
+    /// Mock token endpoint that accepts a request only when it carries a
+    /// `private_key_jwt` client assertion whose signature verifies under
+    /// `key` and whose claims are RFC 7523 §3 conformant for `audience`.
+    struct AssertionCheckingEndpoint {
+        key: jsonwebtoken::DecodingKey,
+        alg: jsonwebtoken::Algorithm,
+        audience: String,
+        seen_jti: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    }
+
+    impl AssertionCheckingEndpoint {
+        fn verify(&self, request: &wiremock::Request) -> Result<(), String> {
+            let form: BTreeMap<String, String> = url::form_urlencoded::parse(&request.body)
+                .into_owned()
+                .collect();
+            if form.contains_key("client_secret") || request.headers.contains_key("authorization") {
+                return Err("a client secret was sent".into());
+            }
+            if form.get("client_assertion_type").map(String::as_str)
+                != Some(client_auth::CLIENT_ASSERTION_TYPE_JWT)
+            {
+                return Err("wrong client_assertion_type".into());
+            }
+            let assertion = form.get("client_assertion").ok_or("no client_assertion")?;
+            let mut validation = jsonwebtoken::Validation::new(self.alg);
+            validation.set_audience(&[&self.audience]);
+            validation.set_issuer(&["mcpg-agent"]);
+            validation.sub = Some("mcpg-agent".into());
+            validation.set_required_spec_claims(&["exp", "iat", "aud", "iss", "sub"]);
+            let claims = jsonwebtoken::decode::<Value>(assertion, &self.key, &validation)
+                .map_err(|e| format!("assertion rejected: {e}"))?
+                .claims;
+            let iat = claims["iat"].as_u64().ok_or("no iat")?;
+            let exp = claims["exp"].as_u64().ok_or("no exp")?;
+            if exp <= iat || exp - iat > 60 {
+                return Err("assertion lifetime over 60 s".into());
+            }
+            let jti = claims["jti"].as_str().ok_or("no jti")?.to_owned();
+            if !self.seen_jti.lock().unwrap().insert(jti) {
+                return Err("jti replayed".into());
+            }
+            if form.get("client_id").map(String::as_str) != Some("mcpg-agent") {
+                return Err("client_id does not match the assertion".into());
+            }
+            Ok(())
+        }
+    }
+
+    impl wiremock::Respond for AssertionCheckingEndpoint {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            match self.verify(request) {
+                Ok(()) => ResponseTemplate::new(200).set_body_json(json!({
+                    "access_token": "tok-jwt",
+                    "token_type": "Bearer",
+                    "expires_in": 3600
+                })),
+                Err(reason) => ResponseTemplate::new(401).set_body_json(json!({
+                    "error": "invalid_client",
+                    "error_description": reason
+                })),
+            }
+        }
+    }
+
+    async fn assertion_endpoint(
+        key: jsonwebtoken::DecodingKey,
+        alg: jsonwebtoken::Algorithm,
+        audience: impl Fn(&MockServer) -> String,
+    ) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(AssertionCheckingEndpoint {
+                key,
+                alg,
+                audience: audience(&server),
+                seen_jti: Default::default(),
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn jwt_provider(server: &MockServer, extra: Value) -> OAuthClientCredentialsPlugin {
+        let mut provider = json!({
+            "token_url": format!("{}/token", server.uri()),
+            "client_id": "mcpg-agent",
+            "client_auth": "private_key_jwt",
+            "key_id": "k1"
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            provider[k] = v.clone();
+        }
+        OAuthClientCredentialsPlugin::from_config_json(
+            &json!({ "providers": { "partner": provider } }).to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn private_key_jwt_sends_a_signed_assertion_per_token_request() {
+        let server = assertion_endpoint(
+            jsonwebtoken::DecodingKey::from_ec_pem(EC_PUB.as_bytes()).unwrap(),
+            jsonwebtoken::Algorithm::ES256,
+            |s| format!("{}/token", s.uri()),
+        )
+        .await;
+        let plugin = jwt_provider(
+            &server,
+            json!({ "private_key": EC_PRIV, "signing_alg": "ES256" }),
+        );
+        for resource in ["https://a.example.com/mcp", "https://b.example.com/mcp"] {
+            let cred = CredentialIssuer::issue(
+                &plugin,
+                &anon_identity(),
+                "partner",
+                &json!({ "resource": resource }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{resource}: {e:?}"));
+            assert_eq!(cred.value.as_deref(), Some("tok-jwt"));
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "one assertion per resource");
+        let header = |i: usize| {
+            let form: BTreeMap<String, String> = url::form_urlencoded::parse(&requests[i].body)
+                .into_owned()
+                .collect();
+            jsonwebtoken::decode_header(&form["client_assertion"]).unwrap()
+        };
+        assert_eq!(header(0).kid.as_deref(), Some("k1"));
+        assert_eq!(header(1).alg, jsonwebtoken::Algorithm::ES256);
+    }
+
+    #[tokio::test]
+    async fn the_mock_endpoint_refuses_an_assertion_signed_by_another_key() {
+        let server = assertion_endpoint(
+            jsonwebtoken::DecodingKey::from_rsa_pem(RSA_PUB.as_bytes()).unwrap(),
+            jsonwebtoken::Algorithm::ES256,
+            |s| format!("{}/token", s.uri()),
+        )
+        .await;
+        let plugin = jwt_provider(&server, json!({ "private_key": EC_PRIV }));
+        let err = CredentialIssuer::issue(&plugin, &anon_identity(), "partner", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, CredentialError::Misconfigured { reason } if reason.contains("invalid_client")),
+            "{err:?}"
+        );
+    }
+
+    async fn metadata(server: &MockServer, methods: Value) {
+        Mock::given(method("GET"))
+            .and(path("/.well-known/oauth-authorization-server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": server.uri(),
+                "token_endpoint": format!("{}/token", server.uri()),
+                "token_endpoint_auth_methods_supported": methods,
+                "token_endpoint_auth_signing_alg_values_supported": ["RS256", "ES256"]
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_jwk_key_signs_for_the_metadata_issuer_by_default() {
+        let server = assertion_endpoint(
+            jsonwebtoken::DecodingKey::from_rsa_pem(RSA_PUB.as_bytes()).unwrap(),
+            jsonwebtoken::Algorithm::RS256,
+            MockServer::uri,
+        )
+        .await;
+        metadata(&server, json!(["client_secret_basic", "private_key_jwt"])).await;
+        let plugin = jwt_provider(
+            &server,
+            json!({
+                "private_key": RSA_JWK,
+                "metadata_url": format!("{}/.well-known/oauth-authorization-server", server.uri())
+            }),
+        );
+        for resource in ["https://a.example.com/mcp", "https://b.example.com/mcp"] {
+            let cred = CredentialIssuer::issue(
+                &plugin,
+                &anon_identity(),
+                "partner",
+                &json!({ "resource": resource }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{resource}: {e:?}"));
+            assert_eq!(cred.value.as_deref(), Some("tok-jwt"));
+        }
+        let requests = server.received_requests().await.unwrap();
+        let gets = requests
+            .iter()
+            .filter(|r| r.method == wiremock::http::Method::GET)
+            .count();
+        assert_eq!(gets, 1, "the metadata is fetched once");
+    }
+
+    #[tokio::test]
+    async fn metadata_without_private_key_jwt_refuses_before_any_token_request() {
+        let server = assertion_endpoint(
+            jsonwebtoken::DecodingKey::from_ec_pem(EC_PUB.as_bytes()).unwrap(),
+            jsonwebtoken::Algorithm::ES256,
+            |s| format!("{}/token", s.uri()),
+        )
+        .await;
+        metadata(
+            &server,
+            json!(["client_secret_basic", "client_secret_post"]),
+        )
+        .await;
+        let plugin = jwt_provider(
+            &server,
+            json!({
+                "private_key": EC_PRIV,
+                "metadata_url": format!("{}/.well-known/oauth-authorization-server", server.uri())
+            }),
+        );
+        let err = CredentialIssuer::issue(&plugin, &anon_identity(), "partner", &json!({}))
+            .await
+            .unwrap_err();
+        match err {
+            CredentialError::Misconfigured { reason } => assert!(
+                reason.contains("provider `partner`")
+                    && reason.contains("does not list `private_key_jwt`")
+                    && reason.contains("client_secret_basic, client_secret_post"),
+                "{reason}"
+            ),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        let posts = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == wiremock::http::Method::POST)
+            .count();
+        assert_eq!(posts, 0, "no token request after a failed metadata check");
+    }
+
+    #[tokio::test]
+    async fn client_secret_basic_sends_the_secret_in_the_header() {
+        let server = token_server("tok").await;
+        let cfg = json!({
+            "providers": {
+                "test": {
+                    "token_url": format!("{}/token", server.uri()),
+                    "client_id": "cid",
+                    "client_secret": "csecret",
+                    "client_auth": "client_secret_basic"
+                }
+            }
+        });
+        let plugin = OAuthClientCredentialsPlugin::from_config_json(&cfg.to_string());
+        CredentialIssuer::issue(&plugin, &anon_identity(), "test", &json!({}))
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let body = std::str::from_utf8(&requests[0].body).unwrap();
+        assert!(!body.contains("csecret"), "no secret in the body: {body}");
+        assert!(requests[0].headers.contains_key("authorization"));
     }
 
     #[tokio::test]

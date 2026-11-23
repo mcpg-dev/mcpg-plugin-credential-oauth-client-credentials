@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-plugin-credential-oauth-client-credentials"
-version = "0.2.0"
+version = "0.3.0"
 license = "Apache-2.0"
 edition = "2024"
 description = "OAuth 2.0 client_credentials credential_issuer plugin for MCPG (RFC 6749 §4.4)"
@@ -9,11 +9,15 @@ description = "OAuth 2.0 client_credentials credential_issuer plugin for MCPG (R
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-rc.12", version = "=0.1.0-rc.12" }
-mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-rc.17", version = "=0.1.0-rc.17" }
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-rc.14", version = "=0.1.0-rc.14" }
+mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-rc.19", version = "=0.1.0-rc.19" }
 async-trait = "0.1"
+base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dashmap = "6"
+# private_key_jwt client assertions. aws_lc_rs is the rustls-clean backend the
+# other in-tree JWT users pin; use_pem enables the PEM key loaders.
+jsonwebtoken = { version = "11.1", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 metrics = "0.24"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "form"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -21,6 +25,8 @@ serde_json = "1.0"
 thiserror = "2.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 tracing = "0.1"
+url = "2.5.8"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 wiremock = "0.6"

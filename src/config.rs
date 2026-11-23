@@ -12,12 +12,25 @@
 //!           client_secret: ${env.GH_CLIENT_SECRET}
 //!           scopes: [repo, read:org]
 //!           resource: https://mcp.example.com/mcp   # optional (RFC 8707)
+//!         partner:                                  # private_key_jwt (RFC 7523)
+//!           token_url: https://auth.partner.example/oauth/token
+//!           client_id: mcpg-agent
+//!           client_auth: private_key_jwt
+//!           private_key: ${secret.PARTNER_CLIENT_KEY}   # PEM or private JWK
+//!           key_id: mcpg-2026-11
+//!           signing_alg: ES256
+//!           issuer: https://auth.partner.example    # the assertion `aud`
+//!           metadata_url: https://auth.partner.example/.well-known/oauth-authorization-server
 //! ```
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::client_auth::{
+    AssertionAudience, ClientAuth, ClientAuthMethod, ClientAuthSettings, SigningAlg,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -37,10 +50,60 @@ pub struct ProviderConfig {
     /// OAuth client ID.
     pub client_id: String,
 
-    /// OAuth client secret. Operators should source this from a
-    /// secret backend via `${env.VAR}` or `cred://...` so the
-    /// literal does not appear in YAML or process logs.
-    pub client_secret: String,
+    /// OAuth client secret, for the two secret methods. Source it via
+    /// `${secret.NAME}` or `${env.VAR}` so the literal does not appear in
+    /// YAML or process logs. Must be unset with `private_key_jwt`.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+
+    /// Client authentication at the token endpoint: `client_secret_post`,
+    /// `client_secret_basic` or `private_key_jwt`. Unset:
+    /// `private_key_jwt` when `private_key` is set, else
+    /// `client_secret_post`.
+    #[serde(default)]
+    pub client_auth: Option<ClientAuthMethod>,
+
+    /// `private_key_jwt`: the signing key, a PEM private key (PKCS#8, or
+    /// PKCS#1 for RSA) or a private JWK (RSA, EC on P-256, OKP on
+    /// Ed25519). Parsed and trial-signed at load. Source it via
+    /// `${secret.NAME}` or `${env.VAR}`.
+    #[serde(default)]
+    pub private_key: Option<String>,
+
+    /// `private_key_jwt`: the `kid` header of the client assertion.
+    /// Unset: the JWK's `kid`, else no `kid`.
+    #[serde(default)]
+    pub key_id: Option<String>,
+
+    /// `private_key_jwt`: the assertion's JWS algorithm (`RS256`, `RS384`,
+    /// `RS512`, `PS256`, `PS384`, `PS512`, `ES256`, `ES384`, `EdDSA`).
+    /// Unset: the JWK's `alg`, else the one the key type implies (RSA:
+    /// RS256, P-256: ES256, P-384: ES384, Ed25519: EdDSA).
+    #[serde(default)]
+    pub signing_alg: Option<SigningAlg>,
+
+    /// `private_key_jwt`: the assertion's `aud`: `issuer` (the authorization
+    /// server's issuer identifier, the form the MCP `oauth-client-credentials`
+    /// extension requires; the metadata's `issuer` when `metadata_url` is
+    /// set, else `issuer`) or `token_endpoint` (the `token_url`, for servers
+    /// that expect it). Unset: `issuer` when `issuer` or `metadata_url` is
+    /// set, else `token_endpoint`.
+    #[serde(default)]
+    pub assertion_audience: Option<AssertionAudience>,
+
+    /// The authorization server's issuer identifier. When `metadata_url`
+    /// is also set, the metadata's `issuer` must equal it.
+    #[serde(default)]
+    pub issuer: Option<String>,
+
+    /// RFC 8414 authorization server metadata URL. When set, the plugin
+    /// fetches it before the first token request and refuses to request a
+    /// token unless `token_endpoint_auth_methods_supported` lists the
+    /// configured method (and, for `private_key_jwt`, a published
+    /// `token_endpoint_auth_signing_alg_values_supported` lists the
+    /// algorithm).
+    #[serde(default)]
+    pub metadata_url: Option<String>,
 
     /// OAuth scopes to request. Sent space-joined per RFC 6749 §3.3.
     #[serde(default)]
@@ -74,6 +137,27 @@ pub struct ProviderConfig {
     pub timeout_ms: u64,
 }
 
+impl ProviderConfig {
+    /// The provider's client authentication, with any signing key parsed.
+    pub(crate) fn client_auth(&self) -> Result<ClientAuth, String> {
+        let configured = |value: &Option<String>| value.as_deref().is_some_and(|v| !v.is_empty());
+        ClientAuth::compile(&ClientAuthSettings {
+            method: self.client_auth,
+            client_id: &self.client_id,
+            client_secret: self.client_secret.as_deref(),
+            private_key: self.private_key.as_deref(),
+            key_id: self.key_id.as_deref(),
+            signing_alg: self.signing_alg,
+            assertion_audience: self.assertion_audience,
+            issuer_available: configured(&self.issuer) || configured(&self.metadata_url),
+        })
+    }
+}
+
+fn is_http_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
 fn default_grant_type() -> String {
     "client_credentials".to_owned()
 }
@@ -100,8 +184,12 @@ pub enum ConfigError {
     InvalidTokenUrlScheme { name: String },
     #[error("credential.oauth-client-credentials: provider `{name}` client_id is empty")]
     EmptyClientId { name: String },
-    #[error("credential.oauth-client-credentials: provider `{name}` client_secret is empty")]
-    EmptyClientSecret { name: String },
+    #[error("credential.oauth-client-credentials: provider `{name}` {reason}")]
+    ClientAuth { name: String, reason: String },
+    #[error(
+        "credential.oauth-client-credentials: provider `{name}` {field} must be an http:// or https:// URL"
+    )]
+    InvalidUrl { name: String, field: &'static str },
     #[error(
         "credential.oauth-client-credentials: provider `{name}` grant_type=`{grant_type}` not supported (only `client_credentials` in v0.1)"
     )]
@@ -149,17 +237,38 @@ impl OAuthConfig {
             if provider.token_url.trim().is_empty() {
                 return Err(ConfigError::EmptyTokenUrl { name: name.clone() });
             }
-            if !provider.token_url.starts_with("http://")
-                && !provider.token_url.starts_with("https://")
-            {
+            if !is_http_url(&provider.token_url) {
                 return Err(ConfigError::InvalidTokenUrlScheme { name: name.clone() });
             }
             if provider.client_id.trim().is_empty() {
                 return Err(ConfigError::EmptyClientId { name: name.clone() });
             }
-            if provider.client_secret.is_empty() {
-                return Err(ConfigError::EmptyClientSecret { name: name.clone() });
+            if provider
+                .metadata_url
+                .as_deref()
+                .is_some_and(|url| !is_http_url(url))
+            {
+                return Err(ConfigError::InvalidUrl {
+                    name: name.clone(),
+                    field: "metadata_url",
+                });
             }
+            if provider
+                .issuer
+                .as_deref()
+                .is_some_and(|url| !is_http_url(url))
+            {
+                return Err(ConfigError::InvalidUrl {
+                    name: name.clone(),
+                    field: "issuer",
+                });
+            }
+            provider
+                .client_auth()
+                .map_err(|reason| ConfigError::ClientAuth {
+                    name: name.clone(),
+                    reason,
+                })?;
             if provider.grant_type != "client_credentials" {
                 return Err(ConfigError::UnsupportedGrantType {
                     name: name.clone(),
@@ -279,10 +388,76 @@ mod tests {
     fn rejects_empty_client_secret() {
         let mut v = minimal();
         v["providers"]["github"]["client_secret"] = json!("");
-        assert!(matches!(
-            OAuthConfig::parse(&v.to_string()).unwrap_err(),
-            ConfigError::EmptyClientSecret { .. }
-        ));
+        match OAuthConfig::parse(&v.to_string()).unwrap_err() {
+            ConfigError::ClientAuth { reason, .. } => {
+                assert!(reason.contains("requires client_secret"), "{reason}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    const EC_PRIV: &str = include_str!("testdata/ec_priv.pem");
+
+    fn private_key_jwt() -> serde_json::Value {
+        json!({
+            "providers": {
+                "partner": {
+                    "token_url": "https://auth.partner.example/oauth/token",
+                    "client_id": "mcpg-agent",
+                    "client_auth": "private_key_jwt",
+                    "private_key": EC_PRIV,
+                    "key_id": "k1",
+                    "signing_alg": "ES256",
+                    "issuer": "https://auth.partner.example",
+                    "assertion_audience": "issuer",
+                    "metadata_url": "https://auth.partner.example/.well-known/oauth-authorization-server"
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn parses_private_key_jwt() {
+        let cfg = OAuthConfig::parse(&private_key_jwt().to_string()).unwrap();
+        let p = &cfg.providers["partner"];
+        assert_eq!(p.client_auth, Some(ClientAuthMethod::PrivateKeyJwt));
+        assert_eq!(p.signing_alg, Some(SigningAlg::Es256));
+        assert_eq!(p.assertion_audience, Some(AssertionAudience::Issuer));
+        assert_eq!(p.client_secret, None);
+    }
+
+    #[test]
+    fn private_key_jwt_config_errors_name_the_provider_not_the_key() {
+        for (field, value, expected) in [
+            (
+                "client_secret",
+                json!("shh"),
+                "client_secret must not be set",
+            ),
+            (
+                "private_key",
+                json!("not a key"),
+                "private_key cannot sign ES256",
+            ),
+            ("signing_alg", json!("RS256"), "cannot sign RS256"),
+            ("metadata_url", json!("file:///x"), "metadata_url must be"),
+            ("issuer", json!("auth.partner.example"), "issuer must be"),
+        ] {
+            let mut v = private_key_jwt();
+            v["providers"]["partner"][field] = value;
+            let err = OAuthConfig::parse(&v.to_string()).unwrap_err().to_string();
+            assert!(
+                err.contains("provider `partner`") && err.contains(expected),
+                "{field}: {err}"
+            );
+            assert!(!err.contains("BEGIN"), "key material leaked: {err}");
+        }
+        let mut v = private_key_jwt();
+        let provider = v["providers"]["partner"].as_object_mut().unwrap();
+        provider.remove("issuer");
+        provider.remove("metadata_url");
+        let err = OAuthConfig::parse(&v.to_string()).unwrap_err().to_string();
+        assert!(err.contains("requires issuer or metadata_url"), "{err}");
     }
 
     #[test]
